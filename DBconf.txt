@@ -1,0 +1,63 @@
+Liste des requete psql pour configurer l'utilisateur appuser qui va insterer les données en base ;
+-- Création de la table "user"
+CREATE TABLE "user" (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(255) NOT NULL,
+    mail VARCHAR(255) NOT NULL,
+    langue VARCHAR(50)
+);
+
+-- Création de la table "film"
+CREATE TABLE film (
+    filmid SERIAL PRIMARY KEY,
+    titre VARCHAR(255) NOT NULL,
+    annee INT NOT NULL,
+    duree INT NOT NULL
+);
+
+-- Création de la table "notes" (relation entre users et films)
+CREATE TABLE notes (
+    iduser INT NOT NULL,
+    idfilm INT NOT NULL,
+    note INT CHECK (note BETWEEN 0 AND 10),
+    PRIMARY KEY (iduser, idfilm),
+    FOREIGN KEY (iduser) REFERENCES "user" (id) ON DELETE CASCADE,
+    FOREIGN KEY (idfilm) REFERENCES film (filmid) ON DELETE CASCADE
+);
+
+
+-- Insertion de quelques utilisateurs
+INSERT INTO "utilisateurs" (username, mail, langue) 
+VALUES 
+    ('alice', 'alice@example.com', 'français'),
+    ('bob', 'bob@example.com', 'anglais'),
+    ('charlie', 'charlie@example.com', 'espagnol');
+
+
+-- Insertion de quelques films
+INSERT INTO film (titre, annee, duree) 
+VALUES 
+    ('Inception', 2010, 148),
+    ('The Matrix', 1999, 136),
+    ('Interstellar', 2014, 169);
+
+
+
+-- Insertion de quelques notes
+INSERT INTO notes (iduser, idfilm, note) 
+VALUES 
+    (1, 1, 9),  -- Alice note Inception avec un 9
+    (1, 2, 8),  -- Alice note The Matrix avec un 8
+    (2, 1, 10), -- Bob note Inception avec un 10
+    (2, 3, 7),  -- Bob note Interstellar avec un 7
+    (3, 2, 6);  -- Charlie note The Matrix avec un 6
+
+
+    
+GRANT USAGE, SELECT ON SEQUENCE utilisateurs_filmid_seq TO appuser ;
+GRANT USAGE, SELECT ON SEQUENCE film_filmid_seq TO appuser;
+GRANT USAGE, SELECT ON SEQUENCE notes_filmid_seq TO appuser ;
+
+GRANT INSERT ON TABLE utilisateurs TO appuser ;
+GRANT INSERT ON TABLE film TO appuser ;
+GRANT INSERT ON TABLE notes TO appuser ;
