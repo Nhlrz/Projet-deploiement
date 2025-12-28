@@ -55,6 +55,23 @@ class Film(db.Model):
             "annee": self.annee,
             "duree": self.duree,
         }
+class Director(db.Model):
+    __tablename__ = "directors"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False)
+
+    films = db.relationship(
+        "Film",
+        back_populates="director",
+        cascade="all, delete"
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+        }
 
 # --------------------------------------------------
 # Routes Utilisateurs
