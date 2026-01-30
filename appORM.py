@@ -1,7 +1,12 @@
 import os
+import json
+import secrets
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from dotenv import load_dotenv
+from datetime import datetime
+import bcrypt
 
 # Load environment variables from .env file
 load_dotenv()
@@ -11,18 +16,82 @@ load_dotenv()
 # --------------------------------------------------
 app = Flask(__name__)
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "film_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", secrets.token_hex(16))
 
+app.secret_key = API_SECRET_KEY
+
+# Database configuration
 app.config["SQLALCHEMY_DATABASE_URI"] = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# Initialize extensions
 db = SQLAlchemy(app)
+CORS(app)
+
+# Load users from JSON file for authentication
+try:
+    with open("users.json") as f:
+        USERS = json.load(f)
+except FileNotFoundError:
+    USERS = {}
+    print("⚠️ Warning: users.json not found. Please create it with user credentials.")
+
+# Session storage
+SESSIONS = {}
+
+
+# --------------------------------------------------
+# Authentication Functions
+# --------------------------------------------------
+def validate_credentials(username, password):
+    """Validate username and password against stored hashed password"""
+    if username not in USERS:
+        return False
+    hashed = USERS[username]
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def get_user_from_token(token):
+    """Get username from session token"""
+    return SESSIONS.get(token)
+
+
+# --------------------------------------------------
+# Middleware - Token Validation
+# --------------------------------------------------
+@app.before_request
+def check_token():
+    """Validate token for protected routes"""
+    public_endpoints = {"login", "logout"}
+    
+    # Allow public endpoints
+    if request.endpoint in public_endpoints or request.method == "OPTIONS":
+        return
+    
+    # Check for Authorization header
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "unauthorized", "message": "Missing or invalid token"}), 401
+    
+    # Extract and validate token
+    try:
+        token = auth.split(" ")[1]
+    except IndexError:
+        return jsonify({"status": "unauthorized", "message": "Invalid token format"}), 401
+    
+    if token not in SESSIONS:
+        return jsonify({"status": "unauthorized", "message": "Invalid or expired token"}), 401
+
 
 # --------------------------------------------------
 # Modèles ORM
@@ -31,8 +100,8 @@ class Utilisateur(db.Model):
     __tablename__ = "utilisateurs"
 
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(100), nullable=False)
-    mail = db.Column(db.String(150), nullable=False)
+    username = db.Column(db.String(100), nullable=False, unique=True)
+    mail = db.Column(db.String(150), nullable=False, unique=True)
     langue = db.Column(db.String(50))
 
     # Relations
@@ -55,8 +124,8 @@ class UserProfile(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("utilisateurs.id"), nullable=False, unique=True)
     bio = db.Column(db.Text)
     avatar_url = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=db.func.now())
-    updated_at = db.Column(db.DateTime, default=db.func.now(), onupdate=db.func.now())
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def to_dict(self):
         return {
@@ -64,8 +133,8 @@ class UserProfile(db.Model):
             "user_id": self.user_id,
             "bio": self.bio,
             "avatar_url": self.avatar_url,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -129,8 +198,52 @@ class Mark(db.Model):
             "mark": self.mark,
         }
 
+
 # --------------------------------------------------
-# Routes Utilisateurs
+# Routes - Authentication
+# --------------------------------------------------
+@app.route("/login", methods=["POST"])
+def login():
+    """Login endpoint - returns bearer token on success"""
+    data = request.get_json()
+    
+    if not data or "username" not in data or "password" not in data:
+        return jsonify({"status": "error", "message": "Missing credentials"}), 400
+
+    username = data["username"]
+    password = data["password"]
+
+    if validate_credentials(username, password):
+        token = secrets.token_hex(32)
+        SESSIONS[token] = username
+        return jsonify({
+            "status": "success",
+            "token": token,
+            "message": "Successfully logged in"
+        }), 200
+    else:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid username or password"
+        }), 401
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """Logout endpoint - removes token from active sessions"""
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
+    
+    token = auth.split()[1]
+    if token in SESSIONS:
+        SESSIONS.pop(token)
+    
+    return jsonify({"status": "success", "message": "Successfully logged out"}), 200
+
+
+# --------------------------------------------------
+# Routes - Utilisateurs
 # --------------------------------------------------
 @app.route("/users", methods=["GET"])
 def get_users():
@@ -144,6 +257,10 @@ def create_user():
 
     if not data.get("username") or not data.get("mail"):
         return jsonify({"error": "username et mail obligatoires"}), 400
+
+    # Check if user already exists
+    if Utilisateur.query.filter_by(username=data["username"]).first():
+        return jsonify({"error": "Cet utilisateur existe déjà"}), 400
 
     user = Utilisateur(
         username=data["username"],
@@ -179,8 +296,9 @@ def delete_user(user_id):
 
     return jsonify({"message": "Utilisateur supprimé"}), 200
 
+
 # --------------------------------------------------
-# Routes UserProfile
+# Routes - UserProfile
 # --------------------------------------------------
 @app.route("/users/<int:user_id>/profile", methods=["GET"])
 def get_user_profile(user_id):
@@ -232,8 +350,9 @@ def update_user_profile(user_id):
 
     return jsonify({"message": "Profil mise à jour", "profile": profile.to_dict()}), 200
 
+
 # --------------------------------------------------
-# Routes Directors
+# Routes - Directors
 # --------------------------------------------------
 @app.route("/directors", methods=["GET"])
 def get_directors():
@@ -271,8 +390,9 @@ def delete_director(director_id):
 
     return jsonify({"message": "Réalisateur supprimé"}), 200
 
+
 # --------------------------------------------------
-# Routes Films
+# Routes - Films
 # --------------------------------------------------
 @app.route("/films", methods=["GET"])
 def get_films():
@@ -327,8 +447,9 @@ def delete_film(film_id):
 
     return jsonify({"message": "Film supprimé"}), 200
 
+
 # --------------------------------------------------
-# Routes Marks (Notes)
+# Routes - Marks (Notes)
 # --------------------------------------------------
 @app.route("/marks", methods=["GET"])
 def get_marks():
@@ -398,19 +519,115 @@ def get_film_marks(film_id):
     marks = Mark.query.filter_by(id_film=film_id).all()
     return jsonify([m.to_dict() for m in marks])
 
-# --------------------------------------------------
-# Initialisation de la base de données
-# --------------------------------------------------
-def init_db():
-    """Crée toutes les tables nécessaires dans la base de données"""
-    with app.app_context():
-        db.create_all()
-        print("✅ Tables de la base de données créées avec succès")
 
 # --------------------------------------------------
-# Lancement
+# Database Initialization
+# --------------------------------------------------
+def init_db():
+    """Initialize the database"""
+    with app.app_context():
+        db.create_all()
+        seed_initial_data()
+        print("✅ Database tables created successfully")
+
+
+def seed_initial_data():
+    """Add initial data to the database"""
+    with app.app_context():
+        # Check if data already exists
+        if Utilisateur.query.first() is not None:
+            print("⚠️ Initial data already exists, skipping seed")
+            return
+
+        try:
+            # Create directors
+            director1 = Director(name="Christopher", surname="Nolan")
+            director2 = Director(name="Lana", surname="Wachowski")
+            director3 = Director(name="Denis", surname="Villeneuve")
+            
+            db.session.add_all([director1, director2, director3])
+            db.session.flush()  # Get the IDs
+            
+            # Create users
+            user1 = Utilisateur(username="alice", mail="alice@example.com", langue="français")
+            user2 = Utilisateur(username="bob", mail="bob@example.com", langue="anglais")
+            user3 = Utilisateur(username="charlie", mail="charlie@example.com", langue="espagnol")
+            
+            db.session.add_all([user1, user2, user3])
+            db.session.flush()  # Get the IDs
+            
+            # Create user profiles
+            profile1 = UserProfile(
+                user_id=user1.id,
+                bio="Passionate about sci-fi films",
+                avatar_url="https://example.com/avatar1.jpg"
+            )
+            profile2 = UserProfile(
+                user_id=user2.id,
+                bio="Cinema classics lover",
+                avatar_url="https://example.com/avatar2.jpg"
+            )
+            profile3 = UserProfile(
+                user_id=user3.id,
+                bio="Adventure films critic",
+                avatar_url="https://example.com/avatar3.jpg"
+            )
+            
+            db.session.add_all([profile1, profile2, profile3])
+            db.session.flush()
+            
+            # Create films
+            film1 = Film(
+                titre="Inception",
+                annee=2010,
+                duree=148,
+                id_director=director1.id
+            )
+            film2 = Film(
+                titre="The Matrix",
+                annee=1999,
+                duree=136,
+                id_director=director2.id
+            )
+            film3 = Film(
+                titre="Interstellar",
+                annee=2014,
+                duree=169,
+                id_director=director1.id
+            )
+            
+            db.session.add_all([film1, film2, film3])
+            db.session.flush()  # Get the IDs
+            
+            # Create marks (ratings)
+            mark1 = Mark(id_film=film1.id, id_user=user1.id, mark=9)
+            mark2 = Mark(id_film=film2.id, id_user=user1.id, mark=8)
+            mark3 = Mark(id_film=film1.id, id_user=user2.id, mark=10)
+            mark4 = Mark(id_film=film3.id, id_user=user2.id, mark=7)
+            mark5 = Mark(id_film=film2.id, id_user=user3.id, mark=6)
+            mark6 = Mark(id_film=film3.id, id_user=user1.id, mark=9)
+            
+            db.session.add_all([mark1, mark2, mark3, mark4, mark5, mark6])
+            
+            # Commit all changes
+            db.session.commit()
+            
+            print("✅ Initial data added successfully")
+            print("   - 3 directors created")
+            print("   - 3 users created")
+            print("   - 3 user profiles created")
+            print("   - 3 films created")
+            print("   - 6 ratings created")
+            
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ Error adding initial data: {str(e)}")
+
+
+# --------------------------------------------------
+# Application Launch
 # --------------------------------------------------
 if __name__ == "__main__":
     init_db()
-    print("🚀 API Flask lancée sur http://127.0.0.1:5000")
+    print("🚀 Flask API running on http://127.0.0.1:5000")
     app.run(debug=True)
